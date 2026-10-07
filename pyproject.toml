@@ -1,0 +1,13 @@
+[project]
+name = "justdowork-proxy"
+version = "0.2.0"
+description = "Claude Code proxy for JustDoWork and 9Router"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "flask>=3.0,<4",
+    "requests>=2.31,<3",
+]
+
+[dependency-groups]
+dev = []

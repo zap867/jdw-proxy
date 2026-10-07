@@ -14,14 +14,27 @@
 # ---------------------------------------------------------------------------
 cd "$(dirname "$0")" || exit 1
 
+if command -v uv >/dev/null 2>&1; then
+  echo "[uv] Using uv environment manager..."
+  if [ -z "$UPSTREAM_API_KEY" ] && grep -q '"api_key": ""' config.json 2>/dev/null; then
+    echo "[-] Note: UPSTREAM_API_KEY is not set in environment or config.json."
+    echo "    Running in Dynamic Pass-through mode (9Router / client will provide API keys per request)."
+  fi
+  echo
+  echo "Starting ccproxy ... (the exact URL is printed on the next line)"
+  echo "Press Ctrl+C to stop."
+  echo
+  exec uv run ccproxy.py
+fi
+
 PY=""
 for c in python3 python; do
   if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
 done
 if [ -z "$PY" ]; then
-  echo "!! Python 3 was not found."
-  echo "   macOS:  brew install python3"
-  echo "   or download it from https://www.python.org/downloads/"
+  echo "!! Neither uv nor Python 3 was found."
+  echo "   Install uv (recommended): curl -LsSf https://astral.sh/uv/install.sh | sh"
+  echo "   or macOS: brew install python3"
   exit 1
 fi
 

@@ -9,6 +9,13 @@ rem its own mock upstream.
 setlocal
 cd /d "%~dp0"
 
+where uv >nul 2>&1
+if not errorlevel 1 (
+  uv run test_offline.py %*
+  pause
+  exit /b 0
+)
+
 if not exist ".venv\Scripts\python.exe" (
   echo .venv not found. Run start.bat once first -- it creates it.
   pause

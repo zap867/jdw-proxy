@@ -32,12 +32,23 @@ web search itself, and hands Claude Code a clean, standards-shaped stream.
 
 ## Requirements
 
-* **Python 3.9 or newer** — [python.org/downloads](https://www.python.org/downloads/)
-* An API key for the relay you're pointing at
-* [Claude Code](https://claude.com/claude-code) (only if you want to run Claude Code through it)
+* **Python 3.9+** or **[uv](https://docs.astral.sh/uv/) (Recommended)** — blazing fast environment & package runner.
+* An API key for the relay you're pointing at (or 9Router configured with multiple keys).
+* [Claude Code](https://claude.com/claude-code) (only if you want to run Claude Code through it).
 
-No compiler, no Docker, no system packages. `flask` and `requests` are pure
-Python and get installed into a local `.venv` for you.
+---
+
+## Quick start with `uv` (Recommended)
+
+If you have `uv` installed:
+
+```sh
+# Start proxy directly (uv automatically resolves dependencies & venv in seconds)
+uv run ccproxy.py
+
+# Run offline tests
+uv run test_offline.py
+```
 
 ---
 
@@ -45,13 +56,13 @@ Python and get installed into a local `.venv` for you.
 
 ```sh
 # 1. get the code
-git clone https://github.com/abdurrehmandaudi/justdowork-proxy.git
-cd justdowork-proxy
+git clone https://github.com/zap867/jdw-proxy.git
+cd jdw-proxy
 
-# 2. put your relay API key in
+# 2. (Optional if using 9Router) put your relay API key in
 export UPSTREAM_API_KEY='sk-...'
 
-# 3. start it (first run creates .venv and installs flask + requests)
+# 3. start it (uses uv if available, or creates .venv automatically)
 sh start.sh
 ```
 

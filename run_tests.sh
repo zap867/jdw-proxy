@@ -8,6 +8,10 @@
 # own mock upstream.
 cd "$(dirname "$0")" || exit 1
 
+if command -v uv >/dev/null 2>&1; then
+  exec uv run test_offline.py "$@"
+fi
+
 if [ ! -x ".venv/bin/python3" ]; then
   echo ".venv not found. Run start.sh once first -- it creates it."
   exit 1

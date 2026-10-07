@@ -5,24 +5,30 @@ rem Licensed under the PolyForm Noncommercial License 1.0.0 -- commercial
 rem use is not permitted without a separate written commercial license.
 rem See LICENSE or https://polyformproject.org/licenses/noncommercial/1.0.0
 rem ---------------------------------------------------------------------------
-rem  Start ccproxy on Windows.
+rem  Start ccproxy on Windows with uv (or python fallback).
 rem  Double-click this file, or run it from cmd / PowerShell:  start.bat
-rem
-rem  The first run creates a local .venv and installs flask + requests into it.
-rem  Nothing is installed globally, and nothing outside this folder is touched.
 rem ---------------------------------------------------------------------------
 setlocal
 cd /d "%~dp0"
 
+where uv >nul 2>&1
+if not errorlevel 1 (
+  echo [uv] Using uv environment manager...
+  echo Starting ccproxy ... the exact URL is printed on the next line.
+  echo Press Ctrl+C to stop.
+  echo.
+  uv run ccproxy.py
+  if errorlevel 1 goto fail
+  exit /b 0
+)
+
 where python >nul 2>&1
 if errorlevel 1 (
   echo.
-  echo !! Python 3 was not found on your PATH.
+  echo !! Neither uv nor Python 3 was found on your PATH.
   echo.
-  echo    Install it from https://www.python.org/downloads/
-  echo    IMPORTANT: on the first installer screen, tick
-  echo       [x] Add python.exe to PATH
-  echo    then close this window and run start.bat again.
+  echo    Install uv (recommended):  powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+  echo    Or install Python from:     https://www.python.org/downloads/
   echo.
   pause
   exit /b 1
@@ -45,12 +51,12 @@ echo Press Ctrl+C to stop.
 echo.
 
 ".venv\Scripts\python.exe" ccproxy.py
-pause
+if errorlevel 1 goto fail
 exit /b 0
 
 :fail
 echo.
-echo Setup failed. The errors are above.
+echo Process exited or failed.
 echo.
 pause
 exit /b 1

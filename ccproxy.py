@@ -1578,6 +1578,14 @@ def process_upstream(upstream, client_req, feats, valid_names):
     if base > 0 and in_tok >= base:
         in_tok -= base
 
+    msg_usage = {
+        "input_tokens": max(0, in_tok),
+        "output_tokens": int(usage.get("output_tokens", 0) or 0),
+    }
+    for k in ("cache_creation_input_tokens", "cache_read_input_tokens"):
+        if k in usage:
+            msg_usage[k] = usage[k]
+
     return {
         "id": upstream.get("id") or ("msg_" + uuid.uuid4().hex[:16]),
         "type": "message",
@@ -1586,19 +1594,20 @@ def process_upstream(upstream, client_req, feats, valid_names):
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": stop_val,
-        "usage": {"input_tokens": max(0, in_tok),
-                  "output_tokens": int(usage.get("output_tokens", 0) or 0)},
+        "usage": msg_usage,
     }, has_tool
 
 
 def synthesize_sse(message, emit_start=True):
     usage = message.get("usage") or {}
     if emit_start:
+        start_usage = dict(usage)
+        start_usage["output_tokens"] = 0
         yield sse("message_start", {"type": "message_start", "message": {
             "id": message.get("id"), "type": "message", "role": "assistant",
             "model": message.get("model"), "content": [], "stop_reason": None,
             "stop_sequence": None,
-            "usage": {"input_tokens": usage.get("input_tokens", 0), "output_tokens": 0}}})
+            "usage": start_usage}})
         yield sse("ping", {"type": "ping"})
     for i, b in enumerate(message.get("content") or []):
         t = b.get("type")
@@ -1633,7 +1642,7 @@ def synthesize_sse(message, emit_start=True):
     yield sse("message_delta", {"type": "message_delta",
               "delta": {"stop_reason": message.get("stop_reason"),
                         "stop_sequence": message.get("stop_sequence")},
-              "usage": {"output_tokens": usage.get("output_tokens", 0)}})
+              "usage": dict(usage)})
     yield sse("message_stop", {"type": "message_stop"})
 
 
@@ -1757,13 +1766,10 @@ def v1_messages():
 
 
 def _stream(payload, client_req, valid_names, breakdown, t0, n, ctx, api_key=None, extra_headers=None):
-    """Streaming: send message_start + a ping immediately, then run the upstream
-    call in a background thread. That way Claude Code never sees dead air."""
-    provisional = "msg_" + uuid.uuid4().hex[:16]
-    yield sse("message_start", {"type": "message_start", "message": {
-        "id": provisional, "type": "message", "role": "assistant",
-        "model": payload.get("model"), "content": [], "stop_reason": None,
-        "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
+    """Streaming: send ping immediately to keep the connection alive (no dead air),
+    then run the upstream call in a background thread. When the response arrives,
+    emit message_start with the real usage metrics (input_tokens) so downstream
+    routers like 9Router track token counts accurately."""
     yield sse("ping", {"type": "ping"})
 
     box = {}
@@ -1795,13 +1801,13 @@ def _stream(payload, client_req, valid_names, breakdown, t0, n, ctx, api_key=Non
     if status >= 400:
         salv = _salvage_truncated(upstream)
         if salv:
-            msg = {"id": provisional, "type": "message", "role": "assistant",
+            msg = {"id": "msg_" + uuid.uuid4().hex[:16], "type": "message", "role": "assistant",
                    "model": payload.get("model"),
                    "content": [{"type": "text", "text": salv}],
                    "stop_reason": "end_turn", "stop_sequence": None,
                    "usage": {"input_tokens": 0, "output_tokens": 0}}
             record(make_rec(n, ctx, ok=True, status=status, note="truncated body salvage"))
-            for ev in synthesize_sse(msg, emit_start=False):
+            for ev in synthesize_sse(msg, emit_start=True):
                 yield ev
             return
         txt = ""
@@ -1823,8 +1829,7 @@ def _stream(payload, client_req, valid_names, breakdown, t0, n, ctx, api_key=Non
         if _said.strip():
             log(f"stream called NO tool; the model said: {head(_said, 260)}")
     record(make_rec(n, ctx, message=message, ok=True, status=status))
-    message["id"] = message.get("id") or provisional
-    for ev in synthesize_sse(message, emit_start=False):
+    for ev in synthesize_sse(message, emit_start=True):
         yield ev
 
 

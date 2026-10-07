@@ -382,8 +382,10 @@ r = requests.post(PROXY, json=dict(base_req, stream=True), timeout=120)
 body = r.text
 check("SSE stream returned 200 OK", r.status_code == 200)
 check("message_start received", "event: message_start" in body)
+check("message_start carried real input_tokens (for 9Router)", '"input_tokens": 12345' in body)
 check("ping received (no dead air)", "event: ping" in body)
 check("text_delta received", "text_delta" in body and "streaming answer" in body)
+check("message_delta carried output_tokens", '"output_tokens": 42' in body)
 check("message_stop received", "event: message_stop" in body)
 
 # (e) count_tokens

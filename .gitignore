@@ -10,6 +10,7 @@ __pycache__/
 # ccproxy's own output
 debug_dump/
 *.log
+ccproxy_log.txt
 
 # editors / OS
 .DS_Store

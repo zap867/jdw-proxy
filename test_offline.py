@@ -293,6 +293,7 @@ MOCK = {"calls": [], "script": []}
 def mock_messages():
     body = freq.get_json(force=True)
     MOCK["calls"].append(body)
+    MOCK.setdefault("headers", []).append(dict(freq.headers))
     idx = len(MOCK["calls"]) - 1
     script = MOCK["script"]
     text = script[idx] if idx < len(script) else "done"
@@ -467,6 +468,72 @@ _last = (st3.get("recent") or [{}])[0]
 check("The per-request row compares kept vs offered history",
       _last.get("raw_hist_tok", 0) > _last.get("hist_tok", 0),
       f"kept={_last.get('hist_tok')} of offered={_last.get('raw_hist_tok')}")
+
+# --------------------------------------------------------------------------- #
+# 6. Dynamic Key & 9Router Pass-through
+# --------------------------------------------------------------------------- #
+print("\n=== 6. Dynamic Key & 9Router Pass-through ===")
+
+MOCK["calls"].clear()
+MOCK.setdefault("headers", []).clear()
+MOCK["script"] = ["dynamic-alice"]
+
+# (a) Pass key via x-api-key
+r_alice = requests.post(
+    "http://127.0.0.1:8798/v1/messages",
+    json=dict(base_req),
+    headers={"x-api-key": "sk-jdw-key-alice"},
+    timeout=30
+)
+check("Request with dynamic x-api-key returned 200 OK", r_alice.status_code == 200)
+last_h = MOCK["headers"][-1] if MOCK.get("headers") else {}
+check("Upstream received forwarded x-api-key: sk-jdw-key-alice",
+      last_h.get("X-Api-Key") == "sk-jdw-key-alice" or last_h.get("x-api-key") == "sk-jdw-key-alice",
+      str(last_h.get("x-api-key") or last_h.get("X-Api-Key")))
+check("Upstream received Bearer token matching x-api-key",
+      "Bearer sk-jdw-key-alice" in (last_h.get("Authorization") or ""))
+
+# (b) Pass key via Authorization: Bearer
+MOCK["script"] = ["dynamic-bob"]
+r_bob = requests.post(
+    "http://127.0.0.1:8798/v1/messages",
+    json=dict(base_req),
+    headers={"Authorization": "Bearer sk-jdw-key-bob"},
+    timeout=30
+)
+check("Request with dynamic Bearer token returned 200 OK", r_bob.status_code == 200)
+last_h = MOCK["headers"][-1] if MOCK.get("headers") else {}
+check("Upstream received forwarded key from Bearer auth: sk-jdw-key-bob",
+      last_h.get("X-Api-Key") == "sk-jdw-key-bob" or last_h.get("x-api-key") == "sk-jdw-key-bob")
+
+# (c) Flexible route without /v1 prefix (/messages)
+MOCK["script"] = ["no-v1-prefix"]
+r_nov1 = requests.post(
+    "http://127.0.0.1:8798/messages",
+    json=dict(base_req),
+    headers={"x-api-key": "sk-jdw-flexible"},
+    timeout=30
+)
+check("Request to /messages (without /v1) returned 200 OK", r_nov1.status_code == 200)
+
+# (d) Forward anthropic-beta header
+MOCK["script"] = ["beta-forwarding"]
+r_beta = requests.post(
+    "http://127.0.0.1:8798/v1/messages",
+    json=dict(base_req),
+    headers={"x-api-key": "sk-jdw-beta", "anthropic-beta": "prompt-caching-2024-07-25"},
+    timeout=30
+)
+check("Request with anthropic-beta returned 200 OK", r_beta.status_code == 200)
+last_h = MOCK["headers"][-1] if MOCK.get("headers") else {}
+check("Upstream received forwarded anthropic-beta header",
+      (last_h.get("Anthropic-Beta") or last_h.get("anthropic-beta")) == "prompt-caching-2024-07-25")
+
+# (e) Health checks
+r_h1 = requests.get("http://127.0.0.1:8798/health", timeout=30).json()
+r_h2 = requests.get("http://127.0.0.1:8798/v1/health", timeout=30).json()
+check("/health and /v1/health report dynamic_key_enabled",
+      r_h1.get("dynamic_key_enabled") is True and r_h2.get("dynamic_key_enabled") is True)
 
 # --------------------------------------------------------------------------- #
 print("\n" + "=" * 60)

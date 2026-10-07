@@ -309,6 +309,7 @@ def stats_snapshot():
         "upstream": CONFIG["upstream_base_url"],
         "model": CONFIG.get("model"),
         "key_set": bool(CONFIG.get("api_key")),
+        "dynamic_key_enabled": True,
         "usage_baseline_tokens": int(FEATS.get("usage_baseline_tokens", 0) or 0),
         "max_history_chars": int(FEATS.get("max_history_chars", 0) or 0),
         "max_tool_result_chars": int(FEATS.get("max_tool_result_chars", 0) or 0),
@@ -1174,11 +1175,44 @@ def execute_server_tool(name, tool_input, feats):
 # Upstream call
 # --------------------------------------------------------------------------- #
 
-def call_upstream(payload):
+def extract_api_key(req):
+    """Extract API key from incoming request headers (sent by 9Router or client).
+    Supports x-api-key and Authorization: Bearer.
+    Falls back to static CONFIG["api_key"] if missing or dummy."""
+    key = req.headers.get("x-api-key")
+    if not key:
+        auth = req.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            key = auth[7:].strip()
+        elif auth:
+            key = auth.strip()
+    if key:
+        key = re.sub(r"[^\x21-\x7e]", "", key)
+    if not key or key.lower() in ("dummy", "placeholder", "none", "null"):
+        key = CONFIG.get("api_key") or ""
+    return key
+
+
+def extract_forward_headers(req):
+    """Forward relevant client headers like anthropic-beta to upstream."""
+    extra = {}
+    for h in ("anthropic-beta", "anthropic-version"):
+        v = req.headers.get(h)
+        if v:
+            extra[h] = v
+    return extra
+
+
+def call_upstream(payload, api_key=None, extra_headers=None):
     url = CONFIG["upstream_base_url"] + "/v1/messages"
-    key = CONFIG.get("api_key") or ""
+    key = api_key or CONFIG.get("api_key") or ""
     headers = {"content-type": "application/json", "x-api-key": key,
                "Authorization": f"Bearer {key}", "anthropic-version": "2023-06-01"}
+    if extra_headers and isinstance(extra_headers, dict):
+        if "anthropic-beta" in extra_headers:
+            headers["anthropic-beta"] = extra_headers["anthropic-beta"]
+        if "anthropic-version" in extra_headers:
+            headers["anthropic-version"] = extra_headers["anthropic-version"]
     attempts = max(1, int(FEATS.get("upstream_retries", 2) or 1))
     backoff = [2.0, 5.0, 10.0]
     retryable = {408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
@@ -1269,10 +1303,10 @@ def _salvage_truncated(upstream):
     return "".join(parts).strip()
 
 
-def resolve_server_tools(payload, feats):
+def resolve_server_tools(payload, feats, api_key=None, extra_headers=None):
     """Call upstream; if the model asked for a server-side web tool, run it here,
     feed the result back, and loop."""
-    status, upstream = call_upstream(payload)
+    status, upstream = call_upstream(payload, api_key=api_key, extra_headers=extra_headers)
     if not feats.get("server_tools_enabled", True):
         return status, upstream
     if status >= 400 or not isinstance(upstream, dict):
@@ -1299,7 +1333,7 @@ def resolve_server_tools(payload, feats):
         payload["messages"].append(
             {"role": "user",
              "content": res.get("blocks") or res.get("text") or "(empty result)"})
-        status, upstream = call_upstream(payload)
+        status, upstream = call_upstream(payload, api_key=api_key, extra_headers=extra_headers)
         if status >= 400 or not isinstance(upstream, dict):
             return status, upstream
     else:
@@ -1307,7 +1341,7 @@ def resolve_server_tools(payload, feats):
             {"role": "user",
              "content": "The tool limit is reached. Answer with what you already "
                         "know; do not call any tool."})
-        status, upstream = call_upstream(payload)
+        status, upstream = call_upstream(payload, api_key=api_key, extra_headers=extra_headers)
     return status, upstream
 
 
@@ -1327,11 +1361,12 @@ def make_fallback_payload(payload):
     return p
 
 
-def resolve_with_fallback(payload, feats):
-    status, upstream = resolve_server_tools(payload, feats)
+def resolve_with_fallback(payload, feats, api_key=None, extra_headers=None):
+    status, upstream = resolve_server_tools(payload, feats, api_key=api_key, extra_headers=extra_headers)
     if status in (400, 422):
         log(f"upstream returned {status} -> retrying with a slim payload")
-        status, upstream = resolve_server_tools(make_fallback_payload(payload), feats)
+        status, upstream = resolve_server_tools(make_fallback_payload(payload), feats,
+                                               api_key=api_key, extra_headers=extra_headers)
     return status, upstream
 
 
@@ -1628,6 +1663,7 @@ def dump_request(n, obj):
 # --------------------------------------------------------------------------- #
 
 @app.route("/v1/messages", methods=["POST"])
+@app.route("/messages", methods=["POST"])
 def v1_messages():
     COUNTER["n"] += 1
     n = COUNTER["n"]
@@ -1637,6 +1673,15 @@ def v1_messages():
             "type": "invalid_request_error", "message": "the messages field is required"}}),
             status=400, content_type="application/json")
 
+    req_key = extract_api_key(request)
+    if not req_key:
+        log(f"REQ #{n} REJECTED: No API key provided in request headers or config")
+        return Response(json.dumps({"type": "error", "error": {
+            "type": "authentication_error",
+            "message": "No API key provided. Pass your JDW key via x-api-key / Authorization header from 9Router, or configure UPSTREAM_API_KEY."}}),
+            status=401, content_type="application/json")
+
+    extra_headers = extract_forward_headers(request)
     wants_stream = bool(body.get("stream"))
     tools = [t for t in (body.get("tools") or []) if isinstance(t, dict)]
     valid_names = {t.get("name") for t in tools if t.get("name")}
@@ -1644,7 +1689,8 @@ def v1_messages():
     dump_request(n, body)
     payload = build_payload(body, FEATS)
     breakdown = payload.pop("_breakdown", {})
-    log(f"===== REQ #{n} | client_msgs={len(body.get('messages', []))} "
+    masked_key = (req_key[:7] + "..." + req_key[-4:]) if len(req_key) > 12 else ("*" * len(req_key))
+    log(f"===== REQ #{n} | key={masked_key} | client_msgs={len(body.get('messages', []))} "
         f"sent_msgs={breakdown.get('history_msgs')} | tools={len(tools)} | "
         f"~tok sys={breakdown.get('system_tok')} tools={breakdown.get('tools_tok')} "
         f"hist={breakdown.get('history_tok')} | stream={wants_stream} =====")
@@ -1657,13 +1703,13 @@ def v1_messages():
 
     if wants_stream:
         return Response(stream_with_context(
-            _stream(payload, body, valid_names, breakdown, t0, n, ctx)),
+            _stream(payload, body, valid_names, breakdown, t0, n, ctx, req_key, extra_headers)),
             content_type="text/event-stream; charset=utf-8",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
                      "Connection": "keep-alive"})
 
     try:
-        status, upstream = resolve_with_fallback(payload, FEATS)
+        status, upstream = resolve_with_fallback(payload, FEATS, api_key=req_key, extra_headers=extra_headers)
     except Exception as e:
         log(f"REQ #{n} upstream EXCEPTION: {e}")
         record(make_rec(n, ctx, ok=False, status=502, note=f"exception: {e}"))
@@ -1710,7 +1756,7 @@ def v1_messages():
     return Response(json.dumps(message), content_type="application/json")
 
 
-def _stream(payload, client_req, valid_names, breakdown, t0, n, ctx):
+def _stream(payload, client_req, valid_names, breakdown, t0, n, ctx, api_key=None, extra_headers=None):
     """Streaming: send message_start + a ping immediately, then run the upstream
     call in a background thread. That way Claude Code never sees dead air."""
     provisional = "msg_" + uuid.uuid4().hex[:16]
@@ -1724,7 +1770,7 @@ def _stream(payload, client_req, valid_names, breakdown, t0, n, ctx):
 
     def worker():
         try:
-            box["v"] = resolve_with_fallback(payload, FEATS)
+            box["v"] = resolve_with_fallback(payload, FEATS, api_key=api_key, extra_headers=extra_headers)
         except Exception as e:
             box["e"] = e
 
@@ -1783,6 +1829,7 @@ def _stream(payload, client_req, valid_names, breakdown, t0, n, ctx):
 
 
 @app.route("/v1/messages/count_tokens", methods=["POST"])
+@app.route("/messages/count_tokens", methods=["POST"])
 def count_tokens():
     body = request.get_json(silent=True) or {}
     total = 0
@@ -1800,6 +1847,7 @@ def count_tokens():
 
 
 @app.route("/v1/models", methods=["GET"])
+@app.route("/models", methods=["GET"])
 def models():
     return Response(json.dumps({"data": [{"type": "model", "id": CONFIG["model"],
                                           "display_name": CONFIG["model"]}]}),
@@ -1807,10 +1855,12 @@ def models():
 
 
 @app.route("/health", methods=["GET"])
+@app.route("/v1/health", methods=["GET"])
 def health():
     return Response(json.dumps({"ok": True, "upstream": CONFIG["upstream_base_url"],
                                 "model": CONFIG["model"],
-                                "key_set": bool(CONFIG.get("api_key"))}),
+                                "key_set": bool(CONFIG.get("api_key")),
+                                "dynamic_key_enabled": True}),
                     content_type="application/json")
 
 
@@ -1860,13 +1910,8 @@ def _shutdown(*_):
 
 if __name__ == "__main__":
     if not CONFIG.get("api_key"):
-        how = ('setx UPSTREAM_API_KEY "sk-..."    (then open a NEW terminal)'
-               if os.name == "nt" else
-               "export UPSTREAM_API_KEY='sk-...'")
-        print("!! UPSTREAM_API_KEY is not set. Either:\n"
-              f"     {how}\n"
-              '   or put the key into config.json as "api_key": "sk-...".')
-        sys.exit(1)
+        log("[info] Static UPSTREAM_API_KEY is not set. Running in dynamic pass-through mode:")
+        log("       API keys from 9Router or client requests will be forwarded to JDW per-request.")
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
     host = CONFIG.get("listen_host", "127.0.0.1")

@@ -191,12 +191,13 @@ function render(s){
   last = s;
   var reqs = s.total_reqs || 0, ok = s.ok || 0, fail = s.fail || 0;
 
-  el("dot").className = "dot" + (s.key_set ? "" : " off");
+  var keyReady = s.key_set || s.dynamic_key_enabled;
+  el("dot").className = "dot" + (keyReady ? "" : " off");
   el("uptime").textContent = "| up " + uptime(s.uptime_s + tick);
   el("meta").innerHTML =
     "<span>upstream <b>" + esc(s.upstream) + "</b></span>" +
     "<span>model <b>" + esc(s.model) + "</b></span>" +
-    "<span>key <b>" + (s.key_set ? "set" : "MISSING") + "</b></span>" +
+    "<span>key <b>" + (s.key_set ? "set (static)" : (s.dynamic_key_enabled ? "dynamic (9Router)" : "MISSING")) + "</b></span>" +
     "<span>avg <b>" + (reqs ? (Number(s.duration||0)/reqs).toFixed(1) : "0") + "s</b></span>";
 
   var avgIn = reqs ? Math.round((s.in_tok||0)/reqs) : 0;

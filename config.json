@@ -5,38 +5,39 @@
   "listen_host": "127.0.0.1",
   "listen_port": 8181,
   "upstream_timeout_s": 300,
-
   "native_tool_map": {
     "Read": "read",
     "Write": "write",
     "Edit": "edit",
     "Bash": "bash"
   },
-
   "features": {
     "tool_injection": true,
     "strict_tool_names": true,
     "compact_tools": true,
     "tool_desc_chars": 220,
-
     "max_history_chars": 220000,
     "max_history_messages": 0,
     "keep_first_user_message": true,
-    "max_tool_result_chars": 4000,
+    "keep_recent_messages": 24,
+    "history_user_reserve": 0.35,
+    "max_tool_result_chars": 32000,
     "max_output_tokens": 16000,
     "cache_system_prefix": true,
-
+    "working_rules": true,
     "strip_thinking": true,
+    "thinking_enabled": true,
+    "thinking_adaptive": true,
+    "thinking_budget_tokens": 2000,
+    "thinking_max_budget_tokens": 8000,
     "enforce_stop_sequences": true,
     "usage_baseline_tokens": 0,
-    "upstream_retries": 2,
-
+    "upstream_retries": 3,
     "server_tools_enabled": true,
     "server_tools_max_iters": 3,
     "web_search_max_results": 6,
     "web_fetch_max_chars": 20000,
     "fetch_image_enabled": true,
-
     "dump_requests": false,
     "dump_keep_files": 50,
     "log_max_bytes": 2000000,

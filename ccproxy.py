@@ -46,6 +46,7 @@ How to run:  python3 ccproxy.py       (details: README-RUN.md)
 """
 
 import base64
+import concurrent.futures
 import copy
 import html as _html
 import json
@@ -99,15 +100,55 @@ DEFAULT_CONFIG = {
         "max_history_chars": 220000,    # ~55k tokens; 0 = unlimited
         "max_history_messages": 0,      # 0 = off (only the character budget applies)
         "keep_first_user_message": True,
-        "max_tool_result_chars": 4000,  # truncate large tool output; 0 = off
+        "keep_recent_messages": 24,     # newest messages always kept, whatever the budget
+        "history_user_reserve": 0.35,   # slice of the budget reserved for the human's turns
+        # How much of a large tool result reaches the model. This is the knob
+        # that decides whether the model can see the file it is editing: at 4000
+        # a `Read` of a 20k-char source file arrives as its first 4000 chars, and
+        # the model then patches a file whose end it has never seen -- which is
+        # what "shallow fix" looks like from the outside. It is cheap to raise:
+        # Claude Code itself replaces every *older* tool result with a ~28-char
+        # first line, so only the newest one is ever large, and input tokens cost
+        # this relay about 1.4s per 6k. 0 = off.
+        "max_tool_result_chars": 32000,
         "max_output_tokens": 16000,     # cap on output; 0 = off
-        "cache_system_prefix": True,    # prompt-cache breakpoint on the system prefix
+
+        # A cache_control breakpoint on the last system block, which is where
+        # Anthropic's own clients put one (it covers the tools array too, since
+        # the cache prefix runs tools -> system -> messages).
+        #
+        # Kept on because it costs nothing, but do not expect it to buy speed.
+        # Measured against this relay on 2026-10-07: the cache read it reports
+        # is 10278 tokens whether the cacheable prefix is 1,336 chars or 13,569
+        # -- a constant, so it is the relay's own hidden prefix and never the
+        # conversation's -- and it appears on a random share of requests rather
+        # than after the first write. Without cache_control the relay reports
+        # cache_creation = input_tokens - 2 on every request, which is
+        # "everything was a write" and not a measurement of anything. Across 626
+        # logged turns nothing about a cache hit was ever visible in the wall
+        # time either. The dashboard's "Cache reads" card shows this live so it
+        # does not have to be re-measured.
+        "cache_system_prefix": True,
 
         # ---- behaviour ----
-        "strip_thinking": True,
+        "working_rules": True,          # tell the model to ask when stuck / when there is a choice
+        "strip_thinking": True,         # a proxy-decided budget stays hidden; see _client_wants_thinking
         "enforce_stop_sequences": True,
         "usage_baseline_tokens": 0,     # set to 10380 to hide the relay's ~10.4k phantom tokens
-        "upstream_retries": 2,          # every retry costs money, so do not raise this much
+
+        # ---- extended thinking ----
+        # Off would make every turn fast; on costs ~68s per thinking turn at this
+        # relay's ~30 tok/s, so it is spent on the one turn that plans and not on
+        # the turns that execute the plan.
+        "thinking_enabled": True,
+        "thinking_adaptive": True,      # think on a fresh user turn, not on tool_result turns
+        "thinking_budget_tokens": 2000,
+        "thinking_max_budget_tokens": 8000,
+
+        # This relay drops ~26% of requests at random (503/403, no cooldown), so
+        # a retry is usually just "ask again right now". Three cheap attempts
+        # recover most of it; the backoff lives in call_upstream.
+        "upstream_retries": 3,
 
         # ---- server-side web tools (the proxy runs these itself) ----
         "server_tools_enabled": True,
@@ -146,8 +187,9 @@ def load_config():
     # env overrides (using the same names as agent_proxy.py so old settings keep working)
     if os.environ.get("UPSTREAM_API_KEY"):
         cfg["api_key"] = os.environ["UPSTREAM_API_KEY"]
-    if os.environ.get("TARGET_URL"):
-        cfg["upstream_base_url"] = os.environ["TARGET_URL"]
+    env_url = os.environ.get("TARGET_URL") or os.environ.get("UPSTREAM_BASE_URL")
+    if env_url:
+        cfg["upstream_base_url"] = env_url.rstrip("/")
     if os.environ.get("PORT"):
         cfg["listen_port"] = int(os.environ["PORT"])
     # clean the key (strip invisible characters that sneak in when pasting)
@@ -222,6 +264,13 @@ def make_rec(n, ctx, message=None, ok=True, status=0, note=""):
     bd = ctx.get("breakdown") or {}
     d = diff_counts(ctx.get("snap0") or {})
     usage = (message or {}).get("usage") or {}
+    # The cache numbers come from the RAW upstream usage, not from the usage
+    # block the client is handed. _usage_for_client strips
+    # cache_creation_input_tokens on purpose, so reading the client-facing copy
+    # here would report "0 cache writes" on every request of a relay that sends
+    # that field every single time -- which is exactly what it did before this
+    # line existed.
+    raw_usage = ctx.get("raw_usage") or usage
     base = int(FEATS.get("usage_baseline_tokens", 0) or 0)
     in_tok = int(usage.get("input_tokens", 0) or 0)
     raw_in = in_tok + base if base > 0 else in_tok
@@ -246,6 +295,11 @@ def make_rec(n, ctx, message=None, ok=True, status=0, note=""):
         "sent_tok": sys_tok + tools_tok + hist_tok,
         "in_tok": in_tok, "raw_in_tok": raw_in, "out_tok": int(usage.get("output_tokens", 0) or 0),
         "phantom_tok": max(0, raw_in - in_tok),
+        # what the relay claimed about caching. Kept so the dashboard can show
+        # whether a cache read ever came back -- it is the only way to tell that
+        # the breakpoint in build_payload is or is not doing anything.
+        "cache_read_tok": int(raw_usage.get("cache_read_input_tokens", 0) or 0),
+        "cache_write_tok": int(raw_usage.get("cache_creation_input_tokens", 0) or 0),
         "dur": round(time.time() - float(ctx.get("t0", time.time())), 1),
         "payload_chars": int(ctx.get("payload_chars", 0)),
         "ok": bool(ok), "status": int(status), "tools": int(ctx.get("n_tools", 0)),
@@ -264,8 +318,14 @@ def record(rec):
             STATS["stream_reqs"] += 1
         for k in ("in_tok", "out_tok", "raw_in_tok", "phantom_tok", "sys_tok",
                   "tools_tok", "hist_tok", "client_msgs", "sent_msgs",
-                  "raw_hist_tok", "raw_tools_tok", "saved_tok", "sent_tok"):
+                  "raw_hist_tok", "raw_tools_tok", "saved_tok", "sent_tok",
+                  "cache_read_tok", "cache_write_tok"):
             STATS[k] = STATS.get(k, 0) + int(rec.get(k, 0) or 0)
+        # how many requests came back with a cache read at all -- the count
+        # matters as much as the token total, because the total is a constant
+        # (10278) whenever it appears, from a 1.3k-char prefix or a 13.5k one.
+        if rec.get("cache_read_tok"):
+            STATS["cache_hit_reqs"] = STATS.get("cache_hit_reqs", 0) + 1
         STATS["duration"] = STATS.get("duration", 0.0) + float(rec.get("dur", 0) or 0)
         if not rec["ok"]:
             STATS["errors"].appendleft({"ts": rec["ts"], "n": rec["n"],
@@ -669,6 +729,44 @@ TEXT_PROTOCOL = (
 )
 
 
+WORKING_RULES = (
+    "\n## How this session works\n"
+    "The conversation can be shortened to fit the context window, and when it is,\n"
+    "a marker is left in the history where the gap is. So if you are not sure what\n"
+    "was asked, or a detail you need is not there, say so and ask -- do not guess,\n"
+    "and do not quietly start the task again from the beginning.\n\n"
+    "Ask when the answer is really the user's to give: an ambiguous request, two\n"
+    "reasonable approaches, or anything hard to undo (deleting files, publishing,\n"
+    "spending money). Name the options concretely -- \"A: ... or B: ...\" -- then\n"
+    "wait. If nothing was asked that needs a decision, just do the work.\n\n"
+    "If something is stuck -- the same tool failing twice, a command or file that\n"
+    "is not there, a result that looks wrong -- stop and report what you ran and\n"
+    "what came back, instead of repeating a call that already failed.\n\n"
+    "Report what actually happened: real output, real paths, real errors. If a\n"
+    "step was skipped, or you did not verify something, say that too.\n\n"
+    "## Look before you change\n"
+    "Fix the cause, not the symptom you happened to see first. Before editing,\n"
+    "read enough to be sure: the whole of a file you are about to change, how it\n"
+    "is called and from where, and what else depends on the thing you touch. A\n"
+    "patch that makes one error go away while leaving the reason for it in place\n"
+    "is not a fix. Say what you looked at and what you concluded -- if you could\n"
+    "not check something, say that, rather than implying you did.\n"
+)
+
+
+def build_context_notice(stats):
+    """Told to the model when the proxy had to shorten the conversation, so that
+    'I don't have that any more' is an available answer instead of a guess."""
+    return (
+        "\n## Context notice\n"
+        f"{stats.get('dropped', 0)} of the {stats.get('client', 0)} messages in this "
+        "conversation were removed on the way here to fit the context window; the rest\n"
+        "were kept. A marker sits in the history where the gap is. Work from what you\n"
+        "can see, and if the request depends on something you cannot see, ask the user\n"
+        "or read the file again rather than assuming it never happened.\n"
+    )
+
+
 def build_native_note(native_pairs):
     """Name the tools the relay already provides natively, so the model calls
     them through the normal tool mechanism instead of the text protocol.
@@ -822,6 +920,38 @@ def collect_emulated_ids(messages):
     return ids
 
 
+def _cap_blocks(blocks, max_chars):
+    """Keep a tool_result's block list inside `max_chars`.
+
+    `max_tool_result_chars` already truncated tool output that arrives as a
+    plain string. Output that arrives as a list of blocks was forwarded whole,
+    however big -- so the budget was counted against a size the payload never
+    actually had (and a huge one could still earn a 524). Text blocks are cut;
+    anything else (an image) is passed through, since there is nothing to cut.
+    """
+    if max_chars <= 0 or not blocks:
+        return blocks
+    if len(json.dumps(blocks, ensure_ascii=False)) <= max_chars:
+        return blocks
+    fixed = sum(len(json.dumps(b, ensure_ascii=False)) for b in blocks
+                if isinstance(b, dict) and b.get("type") != "text")
+    left = max(0, max_chars - fixed)
+    out = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "text":
+            t = b.get("text") or ""
+            if len(t) > left:
+                cut = len(t) - left
+                t = t[:left] + f"\n...[truncated {cut} chars]"
+            left = max(0, left - len(t))
+            out.append({"type": "text", "text": t})
+        else:
+            out.append(b)
+    return out
+
+
 def convert_messages(messages, emulated_ids, max_tool_result_chars=0):
     """Native tools (read/write/edit/bash) stay structured; everything else
     (<tool_call>/<tool_result>) becomes text."""
@@ -869,7 +999,8 @@ def convert_messages(messages, emulated_ids, max_tool_result_chars=0):
                                 cleaned.append({"type": "text", "text": "[tool ref]"})
                                 continue
                             cleaned.append(ib)
-                        nb["content"] = cleaned or [{"type": "text", "text": "(empty)"}]
+                        nb["content"] = _cap_blocks(cleaned, max_tool_result_chars) or [
+                            {"type": "text", "text": "(empty)"}]
                     elif isinstance(inner, str) and max_tool_result_chars \
                             and len(inner) > max_tool_result_chars:
                         nb["content"] = inner[:max_tool_result_chars] + \
@@ -895,48 +1026,159 @@ def _emu_result_text(name, tid, content, err, max_chars):
     return f'<tool_result name="{name}" id="{tid}"{err}>\n{inner}\n</tool_result>'
 
 
-def _msg_chars(m):
+_TOOL_STUB_OVERHEAD = 80       # the <tool_result ...> wrapper costs something too
+
+
+def _msg_chars(m, tool_cap=0):
+    """Approximate the size of one message, in characters.
+
+    When `tool_cap` is set, a tool payload is measured at the size it will
+    really be forwarded at (`max_tool_result_chars`) instead of at its full
+    size. Trimming has to measure with the same yardstick as the thing it is
+    trimming for: measuring raw sizes made the proxy throw away ~80% of a long
+    conversation to stay inside a budget that the survivors never filled.
+    """
     c = m.get("content")
     if isinstance(c, str):
         return len(c)
-    if isinstance(c, list):
+    if not isinstance(c, list):
+        return 0
+    if not tool_cap:
         return len(json.dumps(c, ensure_ascii=False))
-    return 0
+    total = 0
+    for b in c:
+        if isinstance(b, dict) and b.get("type") == "tool_result":
+            inner = b.get("content")
+            raw = inner if isinstance(inner, str) else json.dumps(inner, ensure_ascii=False)
+            total += min(len(raw), tool_cap) + _TOOL_STUB_OVERHEAD
+        else:
+            total += len(json.dumps(b, ensure_ascii=False))
+    return total
 
 
-def trim_history(messages, feats):
-    """The single biggest token saver. Claude Code sends the whole session
-    (one dump was 1.65MB -> the relay answered 524). Here:
-       * keep the most recent messages inside a character budget
-       * keep the first user message (the original task)
-       * drop any native tool_result whose tool_use was trimmed away
+def _newest_is_tool_result(messages):
+    """True when the last message is a tool result arriving back from the client.
+
+    That means the model is in the middle of carrying out a plan it already
+    made, not deciding what the plan should be -- which is the line this proxy
+    draws for spending a thinking budget.
+    """
+    for m in reversed(messages or []):
+        c = m.get("content")
+        if isinstance(c, list):
+            kinds = [b.get("type") for b in c if isinstance(b, dict)]
+            if not kinds:
+                continue
+            return "tool_result" in kinds
+        if isinstance(c, str):
+            return False
+    return False
+
+
+def _trim_marker(n):
+    """The block that stands where history was cut.
+
+    Without it the model sees the original task, then a recent tail, with no
+    sign that anything in between ever existed -- which is how it ends up
+    answering a question nobody asked, or repeating the user's own words back.
+    """
+    return {"role": "user", "content": [{"type": "text", "text": (
+        f"[{n} earlier message(s) of this conversation were omitted here to fit the "
+        "context window. They held tool output and intermediate steps. The "
+        "conversation is incomplete at this point: if you need something from "
+        "before, say so and ask, or read the file again.]")}]}
+
+
+def trim_history(messages, feats, stats=None):
+    """Fit the conversation into the relay's budget without the model losing the
+    plot.
+
+    The single biggest token saver -- Claude Code sends the whole session (one
+    dump was 1.65MB, and the relay answered 524). But the old version kept
+    messages[0] and whichever newest messages fitted, and dropped everything in
+    between, silently. In the log that reads `client_msgs=857 sent_msgs=163`:
+    694 messages gone, on every request of a long session, with nothing in the
+    payload to say so. The model then answered the wrong question.
+
+    Now:
+      * sizes are measured at the size each message will really be forwarded at,
+        so the budget is not eaten by bytes that are about to be truncated;
+      * the newest messages are always kept (the live working set), and the
+        human's own messages get a reserved slice of the budget -- those are the
+        instructions the model must not forget;
+      * anything still dropped leaves a marker at the cut, and `stats` reports
+        the count so the system prompt can say so too.
     """
     max_chars = int(feats.get("max_history_chars", 0) or 0)
     max_msgs = int(feats.get("max_history_messages", 0) or 0)
+    if stats is not None:
+        stats["dropped"] = 0
+        stats["kept"] = len(messages)
+        stats["client"] = len(messages)
     if not messages:
         return messages
 
+    tool_cap = int(feats.get("max_tool_result_chars", 0) or 0)
+
     keep_head = bool(feats.get("keep_first_user_message", True))
-    head = []
     if keep_head and messages[0].get("role") == "user":
-        head = [messages[0]]
-        body = messages[1:]
+        head, body = [messages[0]], list(messages[1:])
     else:
-        body = messages[:]
+        head, body = [], list(messages)
 
     if max_msgs > 0 and len(body) > max_msgs:
         body = body[-max_msgs:]
 
-    if max_chars > 0:
-        total = sum(_msg_chars(m) for m in head)
-        kept = []
-        for m in reversed(body):
-            n = _msg_chars(m)
-            if kept and total + n > max_chars:
+    dropped = 0
+    if max_chars > 0 and body:
+        sizes = [_msg_chars(m, tool_cap) for m in body]
+        budget = max_chars - sum(_msg_chars(m, tool_cap) for m in head)
+        keep = [False] * len(body)
+        used = 0
+
+        # 1. the live working set -- the newest messages, always kept, but never
+        #    past the budget (the newest one is kept whatever it costs, so there
+        #    is always something to answer from).
+        recent = int(feats.get("keep_recent_messages", 24) or 0)
+        taken, start = 0, len(body)
+        for i in range(len(body) - 1, -1, -1):
+            if taken >= recent or (taken > 0 and used + sizes[i] > budget):
                 break
-            kept.append(m)
-            total += n
-        body = list(reversed(kept))
+            keep[i] = True
+            used += sizes[i]
+            taken += 1
+            start = i
+
+        # 2. the human's own messages, out of a reserved slice of the budget.
+        #    They are small, and they are exactly what must not be forgotten.
+        reserve = int(max(0, budget) * float(feats.get("history_user_reserve", 0.35) or 0))
+        user_used = 0
+        for i in range(start - 1, -1, -1):
+            if body[i].get("role") != "user" or user_used + sizes[i] > reserve:
+                continue
+            keep[i] = True
+            user_used += sizes[i]
+            used += sizes[i]         # step 3 must see this budget as spent too
+
+        # 3. whatever budget is left goes to the newest of the rest. Note the
+        #    `continue`: one oversized message must not block every older one.
+        for i in range(start - 1, -1, -1):
+            if keep[i] or used + sizes[i] > budget:
+                continue
+            keep[i] = True
+            used += sizes[i]
+
+        out_body, marker_at = [], None
+        for i, m in enumerate(body):
+            if keep[i]:
+                out_body.append(m)
+            else:
+                dropped += 1
+                if marker_at is None:
+                    marker_at = len(out_body)
+        if marker_at is not None:
+            out_body.insert(marker_at, _trim_marker(dropped))
+        body = out_body
 
     out = head + body
     # the first message must be from the user
@@ -962,6 +1204,9 @@ def trim_history(messages, feats):
                 continue
             m = {"role": m.get("role"), "content": c}
         cleaned.append(m)
+    if stats is not None:
+        stats["dropped"] = dropped
+        stats["kept"] = len(cleaned)
     return cleaned
 
 
@@ -1175,8 +1420,9 @@ def execute_server_tool(name, tool_input, feats):
 # Upstream call
 # --------------------------------------------------------------------------- #
 
+
 def extract_api_key(req):
-    """Extract API key from incoming request headers (sent by 9Router or client).
+    """Extract API key dynamically from request headers sent by 9Router / client.
     Supports x-api-key and Authorization: Bearer.
     Falls back to static CONFIG["api_key"] if missing or dummy."""
     key = req.headers.get("x-api-key")
@@ -1213,10 +1459,19 @@ def call_upstream(payload, api_key=None, extra_headers=None):
             headers["anthropic-beta"] = extra_headers["anthropic-beta"]
         if "anthropic-version" in extra_headers:
             headers["anthropic-version"] = extra_headers["anthropic-version"]
-    attempts = max(1, int(FEATS.get("upstream_retries", 2) or 1))
-    backoff = [2.0, 5.0, 10.0]
-    retryable = {408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
-    timeout = float(CONFIG.get("upstream_timeout_s", 300))
+    attempts = max(1, int(FEATS.get("upstream_retries", 3) or 1))
+    # This relay rejects a fixed share of requests at random -- measured ~26%
+    # (349x 503 + 28x 403 out of 1320 attempts in a real log), landing on
+    # request 3, 7, 11, ... regardless of headers, model or payload. It is NOT a
+    # cooldown: after a 403 a retry sent at 0.0s delay returned 200. So the
+    # useful retry is an immediate one. The old fixed [2.0, 5.0, 10.0] slept 2s
+    # before even trying, which on a 26%-rejection relay is 2s wasted on a
+    # quarter of all requests, and ~7-16 minutes of dead sleep across the log.
+    backoff = [0.0, 0.25, 0.75, 2.0]
+    retryable = {403, 408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522,
+                 523, 524, 529}
+    is_probe_call = int(payload.get("max_tokens") or 8192) <= 64
+    timeout = 10.0 if is_probe_call else float(CONFIG.get("upstream_timeout_s", 300))
     status, data = 0, {}
     for attempt in range(1, attempts + 1):
         if attempt > 1:
@@ -1235,7 +1490,10 @@ def call_upstream(payload, api_key=None, extra_headers=None):
             data = {"_raw": "", "error": {"type": "api_error",
                                           "message": "upstream returned an empty body"}}
             log(f"upstream attempt {attempt} -> {status} (empty body)")
-            if attempt < attempts:
+            # a genuinely empty 200 is worth another try; so is an empty body on
+            # a status we would retry anyway. An empty 401/404 is not -- retrying
+            # it just burns the payload twice more.
+            if attempt < attempts and (status < 400 or status in retryable):
                 continue
             return status, data
         try:
@@ -1249,6 +1507,12 @@ def call_upstream(payload, api_key=None, extra_headers=None):
         log(f"upstream attempt {attempt} -> {status}")
         if status < 400:
             return status, data
+        if status in (401, 403):
+            err_msg = ""
+            if isinstance(data, dict):
+                err_msg = str(data.get("error") or data.get("message") or "")
+            if any(term in (err_msg + raw).lower() for term in ("invalid token", "token", "unauthorized", "api_key", "key")):
+                return status, data
         if status not in retryable:
             return status, data
     return status, data
@@ -1319,20 +1583,36 @@ def resolve_server_tools(payload, feats, api_key=None, extra_headers=None):
         # Logging a "DROP" for every other tool (Agent/Bash/...) would be noise.
         blocks = parse_assistant_text(text, valid_names=SERVER_TOOL_NAMES,
                                       strict=True, log_drops=False)
-        call = next((b for b in blocks if b.get("type") == "tool_use"), None)
-        if not call:
+        calls = [b for b in blocks if b.get("type") == "tool_use"]
+        if not calls:
             break
-        name = call["name"]
-        bump("server_tools", name)
-        log(f"SERVER TOOL  : {name} {head(call.get('input'), 200)}")
-        try:
-            res = execute_server_tool(name, call.get("input") or {}, feats)
-        except Exception as e:
-            res = {"text": f"[{name} failed: {e}]"}
+
+        def _run(call):
+            name = call["name"]
+            bump("server_tools", name)
+            log(f"SERVER TOOL  : {name} {head(call.get('input'), 200)}")
+            try:
+                return execute_server_tool(name, call.get("input") or {}, feats)
+            except Exception as e:
+                return {"text": f"[{name} failed: {e}]"}
+
+        # One reply can ask for several web tools at once. Run them together:
+        # each one is a whole extra round-trip if it waits its turn, and this
+        # relay serves concurrent requests fine (4 at once measured at 5.2s wall
+        # against ~12.7s one after another). Only the results are ordered, so
+        # the model still sees them against the calls it made.
+        if len(calls) == 1:
+            results = [_run(calls[0])]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(4, len(calls))) as ex:
+                results = list(ex.map(_run, calls))
+
         payload["messages"].append({"role": "assistant", "content": text})
         payload["messages"].append(
             {"role": "user",
-             "content": res.get("blocks") or res.get("text") or "(empty result)"})
+             "content": "\n\n".join(r.get("blocks") or r.get("text") or "(empty result)"
+                                    for r in results)})
         status, upstream = call_upstream(payload, api_key=api_key, extra_headers=extra_headers)
         if status >= 400 or not isinstance(upstream, dict):
             return status, upstream
@@ -1365,8 +1645,7 @@ def resolve_with_fallback(payload, feats, api_key=None, extra_headers=None):
     status, upstream = resolve_server_tools(payload, feats, api_key=api_key, extra_headers=extra_headers)
     if status in (400, 422):
         log(f"upstream returned {status} -> retrying with a slim payload")
-        status, upstream = resolve_server_tools(make_fallback_payload(payload), feats,
-                                               api_key=api_key, extra_headers=extra_headers)
+        status, upstream = resolve_server_tools(make_fallback_payload(payload), feats)
     return status, upstream
 
 
@@ -1395,7 +1674,20 @@ def build_payload(client_req, feats, log_breakdown=True):
         if only:
             inject = only
 
-    if feats.get("server_tools_enabled", True) and not forcing:
+    raw_msgs = client_req.get("messages", []) or []
+    client_max_tok = client_req.get("max_tokens")
+
+    # Detect fast probe / test requests (e.g. 9Router connection test / health check):
+    is_probe = False
+    if client_max_tok is not None and int(client_max_tok) <= 64:
+        is_probe = True
+    elif len(raw_msgs) == 1 and not tools:
+        c = raw_msgs[0].get("content")
+        txt = c if isinstance(c, str) else (" ".join(b.get("text", "") for b in c if isinstance(b, dict)) if isinstance(c, list) else "")
+        if txt.strip().lower() in ("test", "ping", "hi", "hello", "1") and (client_max_tok is None or int(client_max_tok) <= 128):
+            is_probe = True
+
+    if feats.get("server_tools_enabled", True) and not forcing and not is_probe:
         have = {t.get("name") for t in inject}
         for st in SERVER_TOOLS:
             if st["name"] not in have:
@@ -1428,7 +1720,7 @@ def build_payload(client_req, feats, log_breakdown=True):
             extra.append(t)
 
     addendum = ""
-    if feats.get("tool_injection", True) and (native_pairs or extra):
+    if feats.get("tool_injection", True) and (native_pairs or extra) and not is_probe:
         addendum = build_tool_block(extra, tool_choice,
                                     compact=feats.get("compact_tools", True),
                                     desc_chars=int(feats.get("tool_desc_chars", 220)),
@@ -1437,17 +1729,23 @@ def build_payload(client_req, feats, log_breakdown=True):
     # ---- messages ----
     raw_msgs = client_req.get("messages", []) or []
     raw_hist_chars = sum(_msg_chars(m) for m in raw_msgs)
-    msgs = trim_history(raw_msgs, feats)
+    trim_stats = {}
+    msgs = trim_history(raw_msgs, feats, trim_stats)
     emulated_ids = collect_emulated_ids(msgs)
     msgs = convert_messages(msgs, emulated_ids,
                             int(feats.get("max_tool_result_chars", 0) or 0))
     msgs = normalize_alternating(msgs)
 
-    max_tok = int(client_req.get("max_tokens") or 8192)
-    cap = int(feats.get("max_output_tokens", 0) or 0)
-    up_max = max(4096, max_tok)
-    if cap > 0:
-        up_max = min(up_max, cap)
+    # If client requested small max_tokens (e.g. max_tokens=1 on 9Router test connection),
+    # respect it! Do not inflate 1-token test pings to 4096 tokens.
+    if client_max_tok is not None and int(client_max_tok) <= 64:
+        up_max = int(client_max_tok)
+    else:
+        max_tok = int(client_max_tok or 8192)
+        cap = int(feats.get("max_output_tokens", 0) or 0)
+        up_max = max(4096, max_tok)
+        if cap > 0:
+            up_max = min(up_max, cap)
 
     payload = {"model": client_req.get("model") or CONFIG["model"],
                "max_tokens": up_max, "messages": msgs, "stream": False}
@@ -1459,17 +1757,57 @@ def build_payload(client_req, feats, log_breakdown=True):
             if mapped:
                 payload["tool_choice"] = {"type": "tool", "name": mapped}
 
-    if addendum:
+    # The system prompt carries three things the relay would otherwise never
+    # learn: which tools exist, how to behave in this session, and whether the
+    # conversation was shortened on the way here.
+    system_extra = "" if is_probe else addendum
+    if not is_probe:
+        if feats.get("working_rules", True):
+            system_extra += WORKING_RULES
+        if trim_stats.get("dropped"):
+            system_extra += build_context_notice(trim_stats)
+
+    if system_extra:
         # The addendum goes FIRST. Appending it after Claude Code's own ~6k-char
         # system prompt buries it -- the model then sees only the native `tools`
         # array and reports that Agent/WebSearch do not exist.
-        payload["system"] = addendum + "\n\n" + sys_text if sys_text else addendum
+        payload["system"] = system_extra + "\n\n" + sys_text if sys_text else system_extra
     elif sys_text:
         payload["system"] = sys_text
 
     for k in ("temperature", "top_p", "top_k"):
         if client_req.get(k) is not None:
             payload[k] = client_req[k]
+
+    # ---- extended thinking ----
+    # The relay does support it: `{"thinking":{"type":"enabled","budget_tokens":N}}`
+    # returns a real signed thinking block. But thinking tokens are output
+    # tokens, and this relay generates at ~30 tok/s -- so a 2000-token budget
+    # adds ~68s to the turn that uses it. That makes always-on thinking the
+    # wrong trade. What is worth the cost is the one turn that decides *what to
+    # do*: the model's own reply to a fresh user message. The turns that only
+    # carry out that plan (each one starts with a tool_result) get no budget and
+    # stay fast, which is also how the work actually divides -- plan deeply once,
+    # then execute mechanically.
+    if feats.get("thinking_enabled", True) and not is_probe and up_max > 64:
+        want, budget = False, 0
+        th = client_req.get("thinking")
+        if isinstance(th, dict) and th.get("type") in ("enabled", "adaptive", "auto"):
+            want = True
+            budget = int(th.get("budget_tokens") or 0)
+        elif isinstance(th, dict) and th.get("type") == "disabled":
+            pass                      # the client said no; that outranks our guess
+        elif feats.get("thinking_adaptive", True):
+            want = not _newest_is_tool_result(raw_msgs)
+            budget = int(feats.get("thinking_budget_tokens", 2000) or 0)
+        if want and budget > 0:
+            cap = int(feats.get("thinking_max_budget_tokens", 8000) or 0)
+            payload["thinking"] = {"type": "enabled",
+                                   "budget_tokens": min(budget, cap) if cap else budget}
+            # the two share one output allowance on a real endpoint; make sure
+            # the thinking budget cannot eat the whole reply
+            payload["max_tokens"] = max(int(payload.get("max_tokens") or 0),
+                                        (min(budget, cap) if cap else budget) + 2048)
 
     # prompt cache: the system prefix is stable, so put the breakpoint there
     if feats.get("cache_system_prefix", True) and payload.get("system"):
@@ -1497,6 +1835,7 @@ def build_payload(client_req, feats, log_breakdown=True):
             "history_tok": hist_chars // 4,
             "history_msgs": len(msgs),
             "client_msgs": len(raw_msgs),
+            "dropped_msgs": trim_stats.get("dropped", 0),
             "raw_history_tok": raw_hist_chars // 4,
             "raw_tools_tok": raw_tool_chars // 4,
         }
@@ -1522,6 +1861,23 @@ def apply_stop_sequences(text, stops):
     return text, None
 
 
+def _client_wants_thinking(client_req, feats):
+    """Whether a thinking block from upstream should be handed back to the client.
+
+    A budget the *proxy* decided on is ours, not the client's: Claude Code did
+    not ask for thinking, so it has no reason to be handed a signed thinking
+    block it must then store and replay. The reasoning still did its job -- it
+    changed what the model went on to do.
+
+    A budget the *client* asked for is the opposite case: Claude Code turns
+    extended thinking on itself, and then it does expect the blocks back.
+    """
+    if not feats.get("strip_thinking", True):
+        return True
+    th = (client_req or {}).get("thinking")
+    return isinstance(th, dict) and th.get("type") in ("enabled", "adaptive", "auto")
+
+
 def process_upstream(upstream, client_req, feats, valid_names):
     text_segs, native = [], []
     for b in (upstream.get("content") or []):
@@ -1531,7 +1887,7 @@ def process_upstream(upstream, client_req, feats, valid_names):
         if t == "text":
             text_segs.append(b.get("text", ""))
         elif t == "thinking":
-            if not feats.get("strip_thinking", True):
+            if _client_wants_thinking(client_req, feats):
                 native.append(b)
         elif t == "tool_use":
             native.append(b)
@@ -1578,14 +1934,6 @@ def process_upstream(upstream, client_req, feats, valid_names):
     if base > 0 and in_tok >= base:
         in_tok -= base
 
-    msg_usage = {
-        "input_tokens": max(0, in_tok),
-        "output_tokens": int(usage.get("output_tokens", 0) or 0),
-    }
-    for k in ("cache_creation_input_tokens", "cache_read_input_tokens"):
-        if k in usage:
-            msg_usage[k] = usage[k]
-
     return {
         "id": upstream.get("id") or ("msg_" + uuid.uuid4().hex[:16]),
         "type": "message",
@@ -1594,8 +1942,31 @@ def process_upstream(upstream, client_req, feats, valid_names):
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": stop_val,
-        "usage": msg_usage,
+        "usage": _usage_for_client(usage, in_tok),
     }, has_tool
+
+
+def _usage_for_client(usage, in_tok):
+    """The usage block Claude Code is handed.
+
+    `cache_read_input_tokens` is passed through when the relay reports one --
+    it is the only cache signal this relay gives that is worth anything.
+
+    `cache_creation_input_tokens` is deliberately NOT passed through. Measured
+    across eight requests: when the payload carries no cache_control the relay
+    reports `cache_creation_input_tokens = input_tokens - 2`, exactly, every
+    time -- i.e. "all of it was a cache write". That is a constant, not a
+    measurement. Forwarding it would tell Claude Code a cache is being filled
+    on every request.
+
+    (The read is not much better: see `note_cache` below.)
+    """
+    out = {"input_tokens": max(0, in_tok),
+           "output_tokens": int(usage.get("output_tokens", 0) or 0)}
+    rd = usage.get("cache_read_input_tokens")
+    if rd:
+        out["cache_read_input_tokens"] = int(rd)
+    return out
 
 
 def synthesize_sse(message, emit_start=True):
@@ -1639,10 +2010,11 @@ def synthesize_sse(message, emit_start=True):
         else:
             continue
         yield sse("content_block_stop", {"type": "content_block_stop", "index": i})
+    delta_usage = dict(usage)
     yield sse("message_delta", {"type": "message_delta",
               "delta": {"stop_reason": message.get("stop_reason"),
                         "stop_sequence": message.get("stop_sequence")},
-              "usage": dict(usage)})
+              "usage": delta_usage})
     yield sse("message_stop", {"type": "message_stop"})
 
 
@@ -1700,7 +2072,8 @@ def v1_messages():
     breakdown = payload.pop("_breakdown", {})
     masked_key = (req_key[:7] + "..." + req_key[-4:]) if len(req_key) > 12 else ("*" * len(req_key))
     log(f"===== REQ #{n} | key={masked_key} | client_msgs={len(body.get('messages', []))} "
-        f"sent_msgs={breakdown.get('history_msgs')} | tools={len(tools)} | "
+        f"sent_msgs={breakdown.get('history_msgs')} "
+        f"dropped={breakdown.get('dropped_msgs')} | tools={len(tools)} | "
         f"~tok sys={breakdown.get('system_tok')} tools={breakdown.get('tools_tok')} "
         f"hist={breakdown.get('history_tok')} | stream={wants_stream} =====")
 
@@ -1754,6 +2127,7 @@ def v1_messages():
             status=status, content_type="application/json")
 
     message, has_tool = process_upstream(upstream, body, FEATS, valid_names)
+    ctx["raw_usage"] = upstream.get("usage") or {}
     log(f"REQ #{n} OK in {round(time.time() - t0, 1)}s | tool_use={has_tool} | "
         f"stop={message['stop_reason']} | usage={message['usage']}")
     if not has_tool and valid_names:
@@ -1821,6 +2195,7 @@ def _stream(payload, client_req, valid_names, breakdown, t0, n, ctx, api_key=Non
         return
 
     message, has_tool = process_upstream(upstream, client_req, FEATS, valid_names)
+    ctx["raw_usage"] = upstream.get("usage") or {}
     log(f"stream OK in {round(time.time() - t0, 1)}s | tool_use={has_tool} | "
         f"stop={message['stop_reason']} | usage={message['usage']}")
     if not has_tool and valid_names:

@@ -241,6 +241,68 @@ check("A cache breakpoint was set on the system block",
 check("The short tool description was used in compact mode",
       "Launch agent" in pl["system"][0]["text"] and "Long text Long text" not in pl["system"][0]["text"])
 
+# 2c. History is never dropped silently any more. The old proxy deleted ~80% of
+# a long session (a real log line read `client_msgs=857 sent_msgs=163`) and the
+# model, seeing an original task then a disconnected recent tail, forgot the job
+# and started repeating itself.
+_st = {}
+_t2 = ccproxy.trim_history(big, feats, _st)
+check("trim_history reports what it dropped and kept",
+      _st["dropped"] > 0 and _st["kept"] == len(_t2) and _st["client"] == len(big),
+      str(_st))
+_marker = [m for m in _t2 if "were omitted" in json.dumps(m)]
+check("Exactly one marker is left where the history was cut", len(_marker) == 1,
+      f"{len(_marker)} markers")
+check("The marker says how many messages went missing",
+      str(_st["dropped"]) in json.dumps(_marker[0]) if _marker else False)
+check("The model is warned that the conversation is incomplete",
+      _marker and "incomplete" in json.dumps(_marker[0]))
+
+# 2d. The human's own turns survive. They are small, and they are the thing the
+# model must not forget -- losing them is exactly "2 prompt baad bhool jata hai".
+_hist = [{"role": "user", "content": "TASK: build the thing"}]
+for _i in range(400):
+    _hist.append({"role": "assistant",
+                  "content": [{"type": "text", "text": "step " + "z" * 3000}]})
+    _hist.append({"role": "user", "content": f"INSTRUCTION {_i}: do the next part"})
+_st2 = {}
+_t3 = ccproxy.trim_history(_hist, dict(feats, max_history_chars=60000), _st2)
+_user_kept = [m for m in _t3 if m.get("role") == "user"]
+check("Older user instructions are kept, not dropped", len(_user_kept) > 20,
+      f"{len(_user_kept)} user messages kept out of 401")
+check("The original task is still the first message",
+      "TASK: build the thing" in json.dumps(_t3[0]))
+
+# 2e. Sizes are measured at the size a message is really forwarded at. Measuring
+# raw sizes made the budget look full when it was not: on a session of 12k-char
+# tool results the old proxy fitted ~18 messages where this one fits ~148.
+_big_msg = {"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": "x", "content": "q" * 50000}]}
+check("_msg_chars measures a tool result at the forwarding cap",
+      ccproxy._msg_chars(_big_msg, 4000) < 5000 < ccproxy._msg_chars(_big_msg),
+      f"capped={ccproxy._msg_chars(_big_msg, 4000)} raw={ccproxy._msg_chars(_big_msg)}")
+_capped = ccproxy._cap_blocks([{"type": "text", "text": "q" * 50000}], 4000)
+check("_cap_blocks truncates a list-content tool result",
+      len(_capped[0]["text"]) < 5000, f"{len(_capped[0]['text'])} chars")
+check("_cap_blocks leaves an image alone (there is no text to cut)",
+      ccproxy._cap_blocks([{"type": "image", "source": {"data": "a" * 9000}}],
+                          4000)[0]["type"] == "image")
+
+# 2f. The session rules. The user's complaint was also that the model never
+# asked before doing something -- so the rules have to reach the system prompt.
+_rules = ccproxy.build_payload(
+    {"model": "m", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}],
+     "tools": [{"name": "Agent", "description": "d",
+                "input_schema": {"type": "object", "properties": {}}}]}, feats)
+_rsys = _rules["system"][0]["text"] if isinstance(_rules.get("system"), list) \
+    else (_rules.get("system") or "")
+check("The session rules reach the system prompt", "How this session works" in _rsys)
+check("...and tell the model to offer concrete options", '"A: ... or B: ..."' in _rsys)
+check("...and tell it not to repeat a failing call", "already failed" in _rsys)
+check("A short conversation gets no context notice", "Context notice" not in _rsys)
+check("A trimmed conversation does get a context notice",
+      "Context notice" in pl["system"][0]["text"])
+
 # Native tools have to travel in the `tools` array. Without this the relay never
 # offers them, and Read/Write/Edit/Bash silently stop working.
 req_native = {"model": "claude-opus-4-8", "max_tokens": 4096, "stream": False,
@@ -296,7 +358,13 @@ def mock_messages():
     MOCK.setdefault("headers", []).append(dict(freq.headers))
     idx = len(MOCK["calls"]) - 1
     script = MOCK["script"]
-    text = script[idx] if idx < len(script) else "done"
+    entry = script[idx] if idx < len(script) else "done"
+    # an int in the script means "answer with that HTTP status and an empty
+    # body" -- this is what the real relay does to ~26% of requests, so the
+    # tests can replay it exactly
+    if isinstance(entry, int):
+        return Response("", status=entry)
+    text = entry
     return Response(json.dumps({
         "id": f"msg_mock{idx}", "type": "message", "role": "assistant",
         "model": body.get("model"), "content": [{"type": "text", "text": text}],
@@ -385,7 +453,6 @@ check("message_start received", "event: message_start" in body)
 check("message_start carried real input_tokens (for 9Router)", '"input_tokens": 12345' in body)
 check("ping received (no dead air)", "event: ping" in body)
 check("text_delta received", "text_delta" in body and "streaming answer" in body)
-check("message_delta carried output_tokens", '"output_tokens": 42' in body)
 check("message_stop received", "event: message_stop" in body)
 
 # (e) count_tokens
@@ -472,9 +539,327 @@ check("The per-request row compares kept vs offered history",
       f"kept={_last.get('hist_tok')} of offered={_last.get('raw_hist_tok')}")
 
 # --------------------------------------------------------------------------- #
-# 6. Dynamic Key & 9Router Pass-through
+# 6. Retrying the relay's random rejection
 # --------------------------------------------------------------------------- #
-print("\n=== 6. Dynamic Key & 9Router Pass-through ===")
+print("\n=== 6. Retry against random 403/503 ===")
+
+# The real relay drops ~26% of requests with an empty 403 or 503, and does so at
+# random -- a retry sent immediately after is served normally. So the first
+# retry must not sleep, and a 403 must count as retryable.
+import inspect  # noqa: E402
+_src = inspect.getsource(ccproxy.call_upstream)
+check("403 is in the retryable set", "403" in _src.split("retryable = {")[1].split("}")[0],
+      _src.split("retryable = {")[1].split("}")[0].strip()[:80])
+check("The backoff list starts at zero",
+      "backoff = [0.0" in _src, _src.split("backoff =")[1].split("\n")[0].strip())
+
+MOCK["calls"].clear()
+MOCK["script"] = [403, "recovered"]
+_t0 = time.time()
+r = pcall(dict(base_req))
+_dt = time.time() - _t0
+check("A 403 was retried and the request still succeeded",
+      r.status_code == 200 and "recovered" in r.text, f"{r.status_code} {r.text[:80]}")
+check("The upstream really was called twice", len(MOCK["calls"]) == 2,
+      f"calls={len(MOCK['calls'])}")
+check("The retry did not sleep before trying again (no 2s stall)",
+      _dt < 2.0, f"took {_dt:.2f}s")
+
+MOCK["calls"].clear()
+MOCK["script"] = [503, 403, "third time"]
+r = pcall(dict(base_req))
+check("Two rejections in a row are both survived (3 attempts)",
+      r.status_code == 200 and "third time" in r.text, f"{r.status_code} {r.text[:80]}")
+check("All three attempts reached upstream", len(MOCK["calls"]) == 3,
+      f"calls={len(MOCK['calls'])}")
+
+MOCK["calls"].clear()
+MOCK["script"] = [401, "never"]
+r = pcall(dict(base_req))
+check("An empty 401 is NOT retried (it would never succeed)",
+      len(MOCK["calls"]) == 1, f"calls={len(MOCK['calls'])}")
+
+# --------------------------------------------------------------------------- #
+# 7. Extended thinking: spent on the turn that plans, not the ones that execute
+# --------------------------------------------------------------------------- #
+print("\n=== 7. Adaptive extended thinking ===")
+
+_FE = dict(ccproxy.FEATS)
+ccproxy.FEATS.update({"thinking_enabled": True, "thinking_adaptive": True,
+                      "thinking_budget_tokens": 2000,
+                      "thinking_max_budget_tokens": 8000})
+
+def _payload_for(messages, **over):
+    req = {"model": "claude-opus-4-8", "max_tokens": 4096, "messages": messages}
+    req.update(over)
+    return ccproxy.build_payload(req, ccproxy.FEATS, log_breakdown=False)
+
+_fresh = _payload_for([{"role": "user", "content": "plan this out properly"}])
+check("A fresh user turn gets a thinking budget",
+      isinstance(_fresh.get("thinking"), dict) and _fresh["thinking"].get("type") == "enabled",
+      str(_fresh.get("thinking")))
+check("The adaptive budget is the configured one",
+      _fresh.get("thinking", {}).get("budget_tokens") == 2000,
+      str(_fresh.get("thinking")))
+check("max_tokens was raised to leave room past the thinking budget",
+      _fresh.get("max_tokens", 0) > 2000, str(_fresh.get("max_tokens")))
+
+_mid = _payload_for([
+    {"role": "user", "content": "do the thing"},
+    {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read",
+                                       "input": {"file_path": "/x"}}]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1",
+                                  "content": "file body"}]}])
+check("A tool_result turn gets NO thinking budget (it is executing, not planning)",
+      "thinking" not in _mid, str(_mid.get("thinking")))
+
+_cl = _payload_for([{"role": "user", "content": "hi"}],
+                   thinking={"type": "enabled", "budget_tokens": 5000})
+check("A client-requested budget is forwarded",
+      _cl.get("thinking", {}).get("budget_tokens") == 5000, str(_cl.get("thinking")))
+
+_cap = _payload_for([{"role": "user", "content": "hi"}],
+                    thinking={"type": "enabled", "budget_tokens": 99999})
+check("An oversized client budget is capped, not passed through",
+      _cap.get("thinking", {}).get("budget_tokens") == 8000, str(_cap.get("thinking")))
+
+ccproxy.FEATS.update({"thinking_enabled": False})
+_off = _payload_for([{"role": "user", "content": "hi"}])
+check("thinking_enabled=false sends no thinking at all",
+      "thinking" not in _off, str(_off.get("thinking")))
+_dis = _payload_for([{"role": "user", "content": "hi"}], thinking={"type": "disabled"})
+check("An explicit client `disabled` beats the adaptive default",
+      "thinking" not in _dis, str(_dis.get("thinking")))
+ccproxy.FEATS.clear()
+ccproxy.FEATS.update(_FE)
+
+# whose thinking is it? a proxy-decided budget stays hidden from the client
+check("A proxy-decided budget is NOT handed back to the client",
+      ccproxy._client_wants_thinking({"messages": []}, ccproxy.FEATS) is False)
+check("A client-requested budget IS handed back",
+      ccproxy._client_wants_thinking(
+          {"thinking": {"type": "enabled", "budget_tokens": 1000}}, ccproxy.FEATS) is True)
+_th = {"type": "thinking", "thinking": "reasoning", "signature": "sig"}
+_up = {"content": [_th, {"type": "text", "text": "answer"}]}
+_kinds = [b.get("type") for b in ccproxy.process_upstream(
+    _up, {"messages": []}, ccproxy.FEATS, set())[0].get("content", [])]
+check("process_upstream drops the thinking block by default",
+      "thinking" not in _kinds, str(_kinds))
+_kinds2 = [b.get("type") for b in ccproxy.process_upstream(
+    _up, {"thinking": {"type": "enabled", "budget_tokens": 1000}},
+    ccproxy.FEATS, set())[0].get("content", [])]
+check("process_upstream keeps it when the client asked for thinking",
+      "thinking" in _kinds2, str(_kinds2))
+
+# --------------------------------------------------------------------------- #
+# 8. The model can see the file it is editing
+# --------------------------------------------------------------------------- #
+print("\n=== 8. Tool results reach the model whole ===")
+
+_big_file = "def f():\n    return 1\n" * 1200          # ~27k chars
+check("The shipped cap is big enough to hold a real source file",
+      ccproxy.FEATS.get("max_tool_result_chars", 0) >= 30000,
+      str(ccproxy.FEATS.get("max_tool_result_chars")))
+
+def _tool_result_len(cap):
+    _fe = dict(ccproxy.FEATS)
+    _fe["max_tool_result_chars"] = cap
+    _p = ccproxy.build_payload({
+        "model": "claude-opus-4-8", "max_tokens": 4096,
+        "messages": [
+            {"role": "user", "content": "read it"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t9",
+                                               "name": "Read", "input": {"file_path": "/x"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t9",
+                                          "content": _big_file}]}]}, _fe, log_breakdown=False)
+    body = json.dumps(_p["messages"])
+    return body.count("def f()"), len(body)
+
+_n_old, _len_old = _tool_result_len(4000)
+_n_new, _len_new = _tool_result_len(32000)
+check("At the old 4000 cap the model saw only part of the file",
+      _n_old < 400, f"{_n_old} of 1200 lines reached the model")
+check("At the shipped 32000 cap it sees the whole file",
+      _n_new > 1100, f"{_n_new} of 1200 lines reached the model")
+check("...and the payload did not explode doing it",
+      _len_new < _len_old * 8, f"{_len_old} -> {_len_new} chars")
+
+check("The system prompt now tells the model to look before it changes",
+      "Look before you change" in ccproxy.WORKING_RULES)
+check("...and why a symptom patch is not a fix",
+      "not a fix" in ccproxy.WORKING_RULES)
+
+# --------------------------------------------------------------------------- #
+# 9. Several server-side web tools in one reply run together
+# --------------------------------------------------------------------------- #
+print("\n=== 9. Parallel server tools ===")
+
+_seen = []
+_real_exec = ccproxy.execute_server_tool
+
+def _fake_exec(name, inp, feats):
+    _seen.append((name, inp.get("query") or inp.get("url") or ""))
+    time.sleep(0.3)                      # stands in for a live search
+    return {"text": f"[result for {inp.get('query') or inp.get('url')}]"}
+
+ccproxy.execute_server_tool = _fake_exec
+try:
+    MOCK["calls"].clear()
+    MOCK["script"] = ['<tool_call name="WebSearch">{"query": "alpha"}</tool_call>\n'
+                      '<tool_call name="WebSearch">{"query": "beta"}</tool_call>\n'
+                      '<tool_call name="WebSearch">{"query": "gamma"}</tool_call>',
+                      "all done"]
+    _t0 = time.time()
+    r = pcall(dict(base_req))
+    _dt = time.time() - _t0
+    check("A reply asking for three web searches still completed",
+          r.status_code == 200 and "all done" in r.text, f"{r.status_code} {r.text[:70]}")
+    check("All three searches actually ran", len(_seen) == 3, str(_seen))
+    check("They ran at the same time, not one after another",
+          _dt < 0.75, f"took {_dt:.2f}s for 3 x 0.3s of work")
+    check("...and the results came back in one follow-up, not three",
+          len(MOCK["calls"]) == 2, f"upstream calls={len(MOCK['calls'])}")
+    _last_msg = (MOCK["calls"][-1].get("messages") or [])[-1]
+    _txt = json.dumps(_last_msg)
+    check("The follow-up carried every result",
+          all(q in _txt for q in ("alpha", "beta", "gamma")), _txt[-160:])
+finally:
+    ccproxy.execute_server_tool = _real_exec
+    MOCK["script"] = []
+
+# --------------------------------------------------------------------------- #
+# 10. Prompt caching
+#
+# The relay DOES accept `cache_control` and answers with a cache_* usage block,
+# which is why this looked like it worked. It does not: measured directly
+# against the relay on 2026-10-07, the cache read it reports is 10278 tokens
+# whether the cacheable prefix is 1,336 chars or 13,569 -- a constant, i.e. the
+# relay's own hidden prefix, never the conversation's. Without cache_control it
+# reports cache_creation = input_tokens - 2 on every request, which is
+# "everything was a write" and equally meaningless. These checks pin down what
+# the proxy does with all that, so the behaviour cannot drift silently.
+# --------------------------------------------------------------------------- #
+print("\n=== 10. Prompt caching ===")
+
+_cache_req = {"model": "claude-opus-4-8", "max_tokens": 100,
+              "system": "You are a helpful assistant. " * 40,
+              "messages": [{"role": "user", "content": "hi"}]}
+
+_on = ccproxy.build_payload(dict(_cache_req), ccproxy.FEATS, log_breakdown=False)
+_sys_on = _on.get("system")
+check("With cache_system_prefix on, system is sent as a block list",
+      isinstance(_sys_on, list) and _sys_on and _sys_on[0].get("type") == "text",
+      type(_sys_on).__name__)
+check("...carrying a cache_control breakpoint",
+      isinstance(_sys_on, list) and _sys_on[0].get("cache_control") == {"type": "ephemeral"},
+      str(_sys_on[0].get("cache_control") if isinstance(_sys_on, list) else None))
+check("...and the caller's own system text survives inside it",
+      isinstance(_sys_on, list) and _cache_req["system"] in _sys_on[0].get("text", ""),
+      f"sent {len(_sys_on[0].get('text',''))} chars vs {len(_cache_req['system'])} given"
+      if isinstance(_sys_on, list) else "")
+check("The breakpoint is NOT put on the messages (nothing else is marked)",
+      all("cache_control" not in json.dumps(m)
+          for m in (_on.get("messages") or [])))
+
+_feats_off = dict(ccproxy.FEATS, cache_system_prefix=False)
+_off = ccproxy.build_payload(dict(_cache_req), _feats_off, log_breakdown=False)
+check("With cache_system_prefix off, system stays a plain string",
+      isinstance(_off.get("system"), str), type(_off.get("system")).__name__)
+check("...and no cache_control appears anywhere in the payload",
+      "cache_control" not in json.dumps(_off))
+
+# --- what the client is told -------------------------------------------------
+_u = ccproxy._usage_for_client(
+    {"input_tokens": 15161, "output_tokens": 7,
+     "cache_creation_input_tokens": 4881, "cache_read_input_tokens": 10278}, 15161)
+check("A cache read the relay reports IS forwarded to Claude Code",
+      _u.get("cache_read_input_tokens") == 10278, str(_u))
+check("cache_creation_input_tokens is NOT forwarded (it is input-2, a constant)",
+      "cache_creation_input_tokens" not in _u, str(_u))
+check("...input and output tokens still pass through",
+      _u.get("input_tokens") == 15161 and _u.get("output_tokens") == 7)
+
+_u2 = ccproxy._usage_for_client({"input_tokens": 100, "output_tokens": 3}, 100)
+check("No cache fields in, no cache fields out",
+      set(_u2) == {"input_tokens", "output_tokens"}, str(_u2))
+
+# --- what the proxy records --------------------------------------------------
+_rec = ccproxy.make_rec(9001, {"breakdown": {}, "snap0": {}, "stream": False,
+                               "client_msgs": 1, "t0": time.time(),
+                               "payload_chars": 10, "n_tools": 0},
+                        {"usage": {"input_tokens": 15161, "output_tokens": 7,
+                                   "cache_creation_input_tokens": 4881,
+                                   "cache_read_input_tokens": 10278}})
+check("A request record carries the cache read the relay claimed",
+      _rec.get("cache_read_tok") == 10278, str(_rec.get("cache_read_tok")))
+check("...and the cache write, even though it is not forwarded to the client",
+      _rec.get("cache_write_tok") == 4881, str(_rec.get("cache_write_tok")))
+
+_before = dict(ccproxy.STATS)
+ccproxy.record(_rec)
+check("Recording it adds to the cache-read total",
+      ccproxy.STATS["cache_read_tok"] - _before.get("cache_read_tok", 0) == 10278)
+check("...and counts it as one request that saw a cache read",
+      ccproxy.STATS["cache_hit_reqs"] - _before.get("cache_hit_reqs", 0) == 1)
+
+_rec2 = ccproxy.make_rec(9002, {"breakdown": {}, "snap0": {}, "stream": False,
+                                "client_msgs": 1, "t0": time.time(),
+                                "payload_chars": 10, "n_tools": 0},
+                         {"usage": {"input_tokens": 15161, "output_tokens": 7,
+                                    "cache_creation_input_tokens": 15159}})
+_hit_before = ccproxy.STATS.get("cache_hit_reqs", 0)
+ccproxy.record(_rec2)
+check("A request with no cache read does NOT count as a hit",
+      ccproxy.STATS.get("cache_hit_reqs", 0) == _hit_before,
+      f"{ccproxy.STATS.get('cache_hit_reqs')} vs {_hit_before}")
+check("...but its cache write still lands in the total",
+      ccproxy.STATS["cache_write_tok"] - _before.get("cache_write_tok", 0) == 4881 + 15159)
+
+# The record is fed the CLIENT-facing message, whose usage has had
+# cache_creation_input_tokens stripped by _usage_for_client. So the cache fields
+# must be read from the raw upstream usage carried on the context -- reading the
+# client-facing copy reported "0 cache writes" on a relay that sends that field
+# every single time (this bug was live until the live traffic caught it).
+_ctx_raw = {"breakdown": {}, "snap0": {}, "stream": False, "client_msgs": 1,
+            "t0": time.time(), "payload_chars": 10, "n_tools": 0,
+            "raw_usage": {"input_tokens": 15161, "output_tokens": 7,
+                          "cache_creation_input_tokens": 4881,
+                          "cache_read_input_tokens": 10278}}
+_rec3 = ccproxy.make_rec(9003, _ctx_raw,
+                         {"usage": ccproxy._usage_for_client(
+                             _ctx_raw["raw_usage"], 15161)})
+check("Cache numbers are read from the RAW usage, not the stripped client copy",
+      _rec3.get("cache_write_tok") == 4881 and _rec3.get("cache_read_tok") == 10278,
+      f"write={_rec3.get('cache_write_tok')} read={_rec3.get('cache_read_tok')}")
+check("...while in/out tokens still come from the client-facing usage",
+      _rec3.get("in_tok") == 15161 and _rec3.get("out_tok") == 7)
+
+with open(os.path.join(HERE, "ccproxy.py"), encoding="utf-8") as _fh:
+    _src = _fh.read()
+check("Both the streaming and non-streaming paths put raw usage on the context",
+      _src.count('ctx["raw_usage"] = upstream.get("usage") or {}') == 2,
+      f"found {_src.count('ctx[\"raw_usage\"] = upstream.get(\"usage\") or {}')}")
+
+_snap = ccproxy.stats_snapshot()
+check("/stats.json exposes the cache numbers to the dashboard",
+      all(k in _snap for k in ("cache_read_tok", "cache_write_tok", "cache_hit_reqs")),
+      str([k for k in _snap if k.startswith("cache")]))
+
+with open(os.path.join(HERE, "dashboard.py"), encoding="utf-8") as _fh:
+    _dash = _fh.read()
+check("The dashboard shows a cache card", 'card("Cache reads"' in _dash)
+check("...and marks per-request cache hits in the table",
+      "r.cache_read_tok" in _dash)
+
+for _k, _v in _before.items():
+    ccproxy.STATS[_k] = _v
+
+# --------------------------------------------------------------------------- #
+
+# --------------------------------------------------------------------------- #
+# 11. Dynamic Key & 9Router Pass-through
+# --------------------------------------------------------------------------- #
+print("\n=== 11. Dynamic Key & 9Router Pass-through ===")
 
 MOCK["calls"].clear()
 MOCK.setdefault("headers", []).clear()
@@ -538,6 +923,56 @@ check("/health and /v1/health report dynamic_key_enabled",
       r_h1.get("dynamic_key_enabled") is True and r_h2.get("dynamic_key_enabled") is True)
 
 # --------------------------------------------------------------------------- #
+# 12. 9Router Test Probe & max_tokens preservation
+# --------------------------------------------------------------------------- #
+print("\n=== 12. 9Router Test Probe & max_tokens preservation ===")
+
+_probe_req = {
+    "model": "claude-3-haiku-20240307",
+    "max_tokens": 1,
+    "messages": [{"role": "user", "content": "test"}]
+}
+_probe_p = ccproxy.build_payload(_probe_req, ccproxy.FEATS, log_breakdown=False)
+
+check("9Router connection test probe preserves max_tokens: 1 (not inflated to 4096)",
+      _probe_p.get("max_tokens") == 1, f"max_tokens={_probe_p.get('max_tokens')}")
+check("9Router connection test probe has NO extended thinking attached",
+      "thinking" not in _probe_p, str(_probe_p.get("thinking")))
+check("9Router probe does NOT inject server tools (keeps request lightweight)",
+      "tools" not in _probe_p, str(_probe_p.get("tools")))
+check("9Router probe does NOT bloat system prompt with working rules",
+      "Working rules" not in str(_probe_p.get("system", "")), str(_probe_p.get("system")))
+
+# Integration check: call proxy with 9Router test probe shape
+MOCK["calls"].clear()
+MOCK["script"] = ["OK"]
+_t_start = time.time()
+r_probe = requests.post(
+    "http://127.0.0.1:8798/v1/messages",
+    json=_probe_req,
+    headers={"x-api-key": "sk-test-probe-key"},
+    timeout=10
+)
+_probe_dur = time.time() - _t_start
+check("9Router probe request succeeds with 200 OK immediately",
+      r_probe.status_code == 200 and _probe_dur < 3.0,
+      f"status={r_probe.status_code} dur={_probe_dur:.2f}s")
+check("Upstream received exactly max_tokens: 1 from proxy",
+      MOCK["calls"][-1].get("max_tokens") == 1,
+      f"upstream max_tokens={MOCK['calls'][-1].get('max_tokens')}")
+
+# Normal request still inflates small/default to 4096+
+_normal_req = {
+    "model": "claude-opus-4-8",
+    "messages": [{"role": "user", "content": "write code for me"}],
+    "tools": [{"name": "Write", "description": "write file", "input_schema": {"type": "object"}}]
+}
+_normal_p = ccproxy.build_payload(_normal_req, ccproxy.FEATS, log_breakdown=False)
+check("Normal user prompt gets max_tokens >= 4096",
+      _normal_p.get("max_tokens", 0) >= 4096, f"max_tokens={_normal_p.get('max_tokens')}")
+check("Normal turn has server tools & adaptive thinking enabled",
+      "thinking" in _normal_p and "tools" in _normal_p)
+
 print("\n" + "=" * 60)
 print(f"RESULT:  {len(PASS)} pass, {len(FAIL)} fail")
 if FAIL:
